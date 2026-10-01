@@ -2,17 +2,31 @@ import { LitElement, css, html, nothing } from 'lit';
 import { customElement, state } from 'lit/decorators.js';
 import {
   applyRules,
+  CHECKPOINT_FAULT_KEY,
   cloneModel,
   createInitialModel,
+  generateSimulatedAiredList,
+  loadCheckpoints,
   mergeConfirmedSegments,
+  migrateDraft,
   normalizeNumbers,
+  parseAiredList,
   queueStats,
+  reconcileAiredList,
+  rollbackFromCheckpoints,
+  saveCheckpoint,
+  SCHEMA_VERSION,
   STORAGE_KEY,
   simulateLatency,
   toSrt,
+  writeCheckpointWithRetry,
   type CaptionSegment,
   type ConnectionState,
   type DeskModel,
+  type ReconcileMismatch,
+  type ReconcileReport,
+  type RecoveryPoint,
+  type RecoveryPointKind,
   type SegmentState,
   type ToastMessage,
 } from './model';
@@ -217,6 +231,46 @@ export class CaptionDesk extends LitElement {
     .live-item p { margin: 5px 0 0; font-size: var(--caption-font-size); line-height: 1.45; }
     .live-item small { display: block; margin-top: 4px; color: var(--cds-text-secondary, #525252); font-size: 9px; }
     .delivery-status { margin: 0 10px 10px; padding: 9px 10px; background: #edf5ff; border-left: 3px solid #0f62fe; color: #0043ce; font-size: 10px; line-height: 1.45; }
+    .delivery-status.redelivery { background: #fff8e1; border-left-color: #f1c21b; color: #684e00; }
+    .delivery-status.reconciled { background: #e6f4ea; border-left-color: #42be65; color: #198038; }
+    .live-item.locked { border-left-color: #42be65; background: color-mix(in srgb, #42be65 8%, var(--cds-layer-02, #f4f4f4)); }
+    .redelivery-tag { color: #8d6e00 !important; }
+
+    .recovery-tabs { display: flex; gap: 6px; margin-bottom: 14px; border-bottom: 1px solid var(--cds-border-subtle, #e0e0e0); }
+    .recovery-tabs button {
+      border: 0; border-bottom: 2px solid transparent; background: transparent; color: var(--cds-text-secondary, #525252);
+      font: 500 12px/1 "IBM Plex Sans", "PingFang SC", sans-serif; padding: 8px 12px; cursor: pointer; margin-bottom: -1px;
+    }
+    .recovery-tabs button.active { color: #0f62fe; border-bottom-color: #0f62fe; }
+    .recovery-tab { display: flex; flex-direction: column; gap: 12px; }
+    .recovery-help { margin: 0; padding: 10px 12px; background: var(--cds-layer-02, #f4f4f4); border-left: 3px solid #0f62fe; font-size: 11px; line-height: 1.6; color: var(--cds-text-secondary, #525252); }
+    .recovery-actions { display: flex; gap: 8px; flex-wrap: wrap; }
+    .checkpoint-list { display: flex; flex-direction: column; gap: 8px; }
+    .checkpoint-card { border: 1px solid var(--cds-border-subtle, #e0e0e0); background: var(--cds-layer, #fff); padding: 10px 12px; }
+    .checkpoint-card.current { border-color: #0f62fe; outline: 1px solid #78a9ff; }
+    .checkpoint-head { display: flex; align-items: center; gap: 10px; flex-wrap: wrap; }
+    .checkpoint-head strong { font-size: 12px; }
+    .checkpoint-head span { color: var(--cds-text-secondary, #525252); font-size: 10px; font-variant-numeric: tabular-nums; }
+    .checkpoint-counts { display: flex; gap: 16px; margin-top: 8px; font-size: 11px; color: var(--cds-text-secondary, #525252); }
+    .checkpoint-counts b { color: var(--cds-text-primary, #161616); font-weight: 600; font-variant-numeric: tabular-nums; }
+    .checkpoint-reason { margin: 6px 0 0; font-size: 10px; color: #8d6e00; line-height: 1.5; }
+    .checkpoint-foot { display: flex; align-items: center; justify-content: space-between; gap: 10px; margin-top: 8px; }
+    .checkpoint-foot > span { color: var(--cds-text-secondary, #525252); font-size: 10px; }
+    .reconcile-summary { display: flex; gap: 16px; flex-wrap: wrap; padding: 10px 12px; background: var(--cds-layer-02, #f4f4f4); font-size: 12px; }
+    .reconcile-summary .ok { color: #198038; }
+    .reconcile-summary .warn { color: #8d6e00; }
+    .reconcile-summary .bad { color: #da1e28; font-weight: 600; }
+    .redelivery-note { padding: 9px 12px; background: #fff8e1; border-left: 3px solid #f1c21b; color: #684e00; font-size: 11px; line-height: 1.6; }
+    .mismatch-list { display: flex; flex-direction: column; gap: 8px; }
+    .mismatch-card { border: 1px solid var(--cds-border-subtle, #e0e0e0); border-left: 3px solid #da1e28; background: var(--cds-layer, #fff); padding: 10px 12px; }
+    .mismatch-head { display: flex; align-items: center; gap: 10px; }
+    .mismatch-head strong { font-size: 12px; }
+    .mismatch-reason { margin: 6px 0 0; font-size: 11px; color: var(--cds-text-secondary, #525252); line-height: 1.5; }
+    .mismatch-compare { display: flex; flex-direction: column; gap: 4px; margin-top: 8px; font-size: 11px; line-height: 1.5; }
+    .mismatch-compare span { color: var(--cds-text-secondary, #525252); }
+    .mismatch-actions { display: flex; gap: 8px; margin-top: 10px; flex-wrap: wrap; }
+    .migration-list { margin: 0; padding: 10px 12px 10px 28px; background: var(--cds-layer, #fff); border: 1px solid var(--cds-border-subtle, #e0e0e0); font-size: 11px; line-height: 1.7; }
+    .migration-list li { margin: 2px 0; }
 
     .toast-stack { position: fixed; right: 18px; bottom: 18px; z-index: 20; width: 380px; display: flex; flex-direction: column; gap: 8px; }
     cds-toast-notification { box-shadow: 0 8px 22px rgba(0,0,0,.18); }
@@ -238,7 +292,7 @@ export class CaptionDesk extends LitElement {
     }
   `;
 
-  @state() private model: DeskModel = this.loadModel();
+  @state() private model: DeskModel = this.loadDesk().model;
   @state() private dark = localStorage.getItem(`${STORAGE_KEY}-theme`) === 'dark';
   @state() private toasts: ToastMessage[] = [];
   @state() private ruleSource = '';
@@ -246,6 +300,13 @@ export class CaptionDesk extends LitElement {
   @state() private ruleSpeaker = '';
   @state() private filter: 'active' | 'all' | 'attention' = 'active';
   @state() private showRuleForm = false;
+  @state() private showRecoveryCenter = false;
+  @state() private recoveryTab: 'checkpoints' | 'reconcile' | 'migration' = 'checkpoints';
+  @state() private checkpoints: RecoveryPoint[] = [];
+  @state() private migrationNotes: string[] = this.loadDesk().notes;
+  @state() private airedDraft = '';
+  @state() private reconcileReport: ReconcileReport | null = null;
+  @state() private faultArmed = localStorage.getItem(CHECKPOINT_FAULT_KEY) === '1';
   private past: DeskModel[] = [];
   private future: DeskModel[] = [];
   private ticker?: number;
@@ -253,6 +314,28 @@ export class CaptionDesk extends LitElement {
   connectedCallback(): void {
     super.connectedCallback();
     window.addEventListener('keydown', this.handleShortcut);
+    this.checkpoints = loadCheckpoints();
+
+    if (this.migrationNotes.length) {
+      // 旧稿升级：落库并写一份迁移恢复点，接不上的片段原因已记录。
+      this.persist();
+      const result = saveCheckpoint(this.model, 'migrate', '旧稿升级后首次保存', this.migrationNotes.join('；'));
+      if (result.ok) {
+        this.model = { ...this.model, lastCheckpointId: result.id };
+        this.persist();
+        this.checkpoints = loadCheckpoints();
+      }
+      this.recoveryTab = 'migration';
+      this.showRecoveryCenter = true;
+    } else {
+      // 崩溃检测：恢复点比当前稿新，说明关机前写了恢复点但没来得及更新当前稿。
+      const crashPoint = this.checkpoints.find((cp) => cp.savedAt > (this.model.updatedAt ?? 0) + 1000);
+      if (crashPoint) {
+        this.recoveryTab = 'checkpoints';
+        this.showRecoveryCenter = true;
+      }
+    }
+
     this.ticker = window.setInterval(() => {
       const next = simulateLatency(this.model);
       const changed = JSON.stringify(next.segments) !== JSON.stringify(this.model.segments) || next.connection !== this.model.connection;
@@ -268,17 +351,22 @@ export class CaptionDesk extends LitElement {
     super.disconnectedCallback();
   }
 
-  private loadModel(): DeskModel {
+  private loadDesk(): { model: DeskModel; notes: string[] } {
     try {
       const raw = localStorage.getItem(STORAGE_KEY);
       if (raw) {
-        const parsed = JSON.parse(raw) as DeskModel;
-        if (parsed.segments?.length) return parsed;
+        const result = migrateDraft(JSON.parse(raw));
+        if (result.migrated || result.model.segments?.length) {
+          return {
+            model: result.model,
+            notes: result.notes.length ? result.notes : (result.model.migrationNotes ?? []),
+          };
+        }
       }
     } catch {
       // 损坏草稿会回退到演示数据。
     }
-    return createInitialModel();
+    return { model: createInitialModel(), notes: [] };
   }
 
   private persist(): void {
@@ -294,6 +382,42 @@ export class CaptionDesk extends LitElement {
     this.model = next;
     this.persist();
     if (label) this.pushToast('info', label, '已写入浏览器本地草稿');
+  }
+
+  /**
+   * 确认等关键操作：先写恢复点，再动当前稿。
+   * 恢复点写失败时从上一版重试一次；仍失败则回滚当前稿，本次修改不落地。
+   */
+  private commitWithCheckpoint(label: string, kind: RecoveryPointKind, update: (current: DeskModel) => DeskModel): boolean {
+    const previous = cloneModel(this.model);
+    const checkpoint = writeCheckpointWithRetry(previous, kind, label);
+    if (!checkpoint.ok) {
+      const rolled = rollbackFromCheckpoints();
+      if (rolled) {
+        this.model = rolled;
+        this.persist();
+      }
+      this.checkpoints = loadCheckpoints();
+      this.pushToast('error', '恢复点写入失败', '当前稿未改动，已从上一版恢复点重试');
+      return false;
+    }
+    const next = update(cloneModel(this.model));
+    next.updatedAt = Date.now();
+    next.lastCheckpointId = checkpoint.id;
+    this.past = [...this.past, previous].slice(-HISTORY_LIMIT);
+    this.future = [];
+    this.model = next;
+    this.persist();
+    this.checkpoints = loadCheckpoints();
+    return true;
+  }
+
+  private guardLocked(segment: CaptionSegment | undefined): boolean {
+    if (segment?.locked) {
+      this.pushToast('warning', '该片段已上屏锁定', '播控已确认播出，内容不能再修改；如需改动请先处理播控对账');
+      return true;
+    }
+    return false;
   }
 
   private automatic(next: DeskModel): void {
@@ -345,6 +469,7 @@ export class CaptionDesk extends LitElement {
   private updateSelected(patch: Partial<CaptionSegment>, label = ''): void {
     const selected = this.selected;
     if (!selected) return;
+    if (this.guardLocked(selected)) return;
     this.commit(label, (current) => ({
       ...current,
       segments: current.segments.map((item) => item.id === selected.id ? { ...item, ...patch, revision: item.revision + 1 } : item),
@@ -367,6 +492,7 @@ export class CaptionDesk extends LitElement {
     const selected = this.selected;
     const rule = this.model.rules.find((item) => item.id === ruleId);
     if (!selected || !rule) return;
+    if (this.guardLocked(selected)) return;
     const flags = rule.caseSensitive ? 'g' : 'gi';
     const expression = new RegExp(rule.source.replace(/[.*+?^${}()|[\]\\]/g, '\\$&'), flags);
     if (!expression.test(selected.corrected)) {
@@ -436,10 +562,11 @@ export class CaptionDesk extends LitElement {
       this.pushToast('warning', '没有可确认的片段', '请先从待确认区选择字幕');
       return;
     }
+    if (this.guardLocked(selected)) return;
     const { text, used } = applyRules(selected.corrected, this.model);
     const offline = this.model.connection === 'offline';
     const nextOrder = this.pendingSegments.filter((item) => item.id !== selected.id);
-    this.commit('确认并送入直播区', (current) => ({
+    const ok = this.commitWithCheckpoint('确认并送入直播区', 'confirm', (current) => ({
       ...current,
       segments: current.segments.map((item) => item.id === selected.id ? {
         ...item,
@@ -454,12 +581,14 @@ export class CaptionDesk extends LitElement {
       rules: current.rules.map((rule) => used.includes(rule.id) ? { ...rule, usageCount: rule.usageCount + 1 } : rule),
       selectedId: nextOrder[0]?.id ?? selected.id,
     }));
-    this.pushToast(offline ? 'warning' : 'success', offline ? '已加入离线发件箱' : '字幕已进入直播区', offline ? '恢复连接后将按时间顺序合并' : `第 ${selected.sequence} 段已确认`);
+    if (!ok) return;
+    this.pushToast(offline ? 'warning' : 'success', offline ? '已加入离线发件箱' : '字幕已进入直播区', offline ? '恢复连接后将按时间顺序合并' : `第 ${selected.sequence} 段已确认，恢复点已先于当前稿写入`);
   }
 
   private ignoreSelected(): void {
     const selected = this.selected;
     if (!selected) return;
+    if (this.guardLocked(selected)) return;
     const next = this.pendingSegments.find((item) => item.id !== selected.id);
     this.commit('忽略问题片段', (current) => ({
       ...current,
@@ -560,6 +689,103 @@ export class CaptionDesk extends LitElement {
     localStorage.setItem(`${STORAGE_KEY}-theme`, this.dark ? 'dark' : 'light');
   }
 
+  // ── 恢复中心 ──────────────────────────────────────────────
+
+  private openRecoveryCenter(tab: 'checkpoints' | 'reconcile' | 'migration'): void {
+    this.recoveryTab = tab;
+    this.showRecoveryCenter = true;
+    this.checkpoints = loadCheckpoints();
+  }
+
+  private adoptCheckpoint(point: RecoveryPoint): void {
+    this.model = cloneModel(point.model);
+    this.past = [];
+    this.future = [];
+    this.persist();
+    this.checkpoints = loadCheckpoints();
+    this.showRecoveryCenter = false;
+    this.reconcileReport = null;
+    this.pushToast('success', '已采用所选恢复点', `${point.label} · ${new Date(point.savedAt).toLocaleString('zh-CN')}`);
+  }
+
+  private createManualCheckpoint(): void {
+    const result = saveCheckpoint(this.model, 'manual', '值班员手动创建恢复点');
+    if (result.ok) {
+      this.model = { ...this.model, lastCheckpointId: result.id, updatedAt: Date.now() };
+      this.persist();
+      this.checkpoints = loadCheckpoints();
+      this.pushToast('success', '恢复点已创建', '当前确认记录、术语规则和待确认队列已存档');
+    } else {
+      this.pushToast('error', '恢复点写入失败', '请检查浏览器存储后重试');
+    }
+  }
+
+  private toggleFault(): void {
+    this.faultArmed = !this.faultArmed;
+    if (this.faultArmed) localStorage.setItem(CHECKPOINT_FAULT_KEY, '1');
+    else localStorage.removeItem(CHECKPOINT_FAULT_KEY);
+  }
+
+  private fillSimulatedAiredList(): void {
+    this.airedDraft = generateSimulatedAiredList(this.model);
+    this.pushToast('info', '已生成模拟播控清单', '可在文本框中修改后开始对账');
+  }
+
+  private runReconcile(): void {
+    let items;
+    try {
+      items = parseAiredList(this.airedDraft);
+    } catch (error) {
+      this.pushToast('error', '清单无法解析', (error as Error).message);
+      return;
+    }
+    if (!items.length) {
+      this.pushToast('warning', '清单为空', '请先粘贴或生成播控已播清单');
+      return;
+    }
+    const result = reconcileAiredList(this.model, items);
+    this.model = result.model;
+    this.persist();
+    this.reconcileReport = result.report;
+    this.pushToast(
+      'success',
+      '对账完成',
+      `已上屏锁定 ${result.report.matched.length} 段 · 待重新送播 ${result.report.redeliver.length} 段 · 异常 ${result.report.mismatches.length} 条`,
+    );
+  }
+
+  private resolveMismatch(mismatch: ReconcileMismatch, adoptAired: boolean): void {
+    if (mismatch.kind === 'text-diff' && adoptAired && mismatch.segmentId) {
+      this.model = {
+        ...this.model,
+        segments: this.model.segments.map((item) => item.id === mismatch.segmentId ? {
+          ...item,
+          corrected: mismatch.airedText,
+          locked: true,
+          aired: true,
+          airedAt: Date.now(),
+          revision: item.revision + 1,
+        } : item),
+        updatedAt: Date.now(),
+      };
+      this.persist();
+    }
+    if (this.reconcileReport) {
+      this.reconcileReport = { ...this.reconcileReport, mismatches: this.reconcileReport.mismatches.filter((item) => item !== mismatch) };
+    }
+  }
+
+  private checkpointKindLabel(kind: RecoveryPointKind): string {
+    return {
+      confirm: '确认存档',
+      rule: '规则存档',
+      ignore: '忽略存档',
+      edit: '修改存档',
+      manual: '手动存档',
+      migrate: '升级存档',
+    }[kind];
+  }
+
   private handleShortcut = (event: KeyboardEvent): void => {
     const modifier = event.metaKey || event.ctrlKey;
     if (modifier && event.key.toLocaleLowerCase() === 'z') {
@@ -605,7 +831,7 @@ export class CaptionDesk extends LitElement {
           <button class="segment-card ${item.id === this.model.selectedId ? 'selected' : ''} ${item.state}" @click=${() => this.selectSegment(item.id)}>
             <div class="segment-meta">
               <span>${formatClock(item.startTime)} · #${String(item.sequence).padStart(3, '0')}</span>
-              <span class="segment-state ${item.state}">${stateLabel(item.state)}</span>
+              <span class="segment-state ${item.state}">${stateLabel(item.state)}${item.locked ? ' · 已上屏锁定' : ''}</span>
             </div>
             <p class="segment-text">${item.original}</p>
             ${item.corrected !== item.original ? html`<p class="segment-corrected">${item.corrected}</p>` : nothing}
@@ -643,6 +869,9 @@ export class CaptionDesk extends LitElement {
             </div>
           </div>
           <div class="editor-form">
+            ${item.locked ? html`
+              <cds-inline-notification kind="success" low-contrast title="该片段已上屏锁定" subtitle="播控已确认播出，内容不可再修改。如需改动，请先到恢复中心处理播控对账。"></cds-inline-notification>
+            ` : nothing}
             ${item.state === 'duplicate' ? html`
               <cds-inline-notification kind="warning" low-contrast title="重复片段提示" subtitle=${item.staleReason || '与已确认片段高度相似'}>
                 <cds-button slot="action" size="sm" @click=${this.recoverDuplicate}>保留并继续校对</cds-button>
@@ -652,7 +881,7 @@ export class CaptionDesk extends LitElement {
               <cds-inline-notification kind="warning" low-contrast title="过期修改" subtitle=${`${item.staleReason || '该片段已超过 90 秒未确认'}。请结合上下文确认，或忽略以避免污染直播区。`}></cds-inline-notification>
             ` : nothing}
             <div class="form-grid">
-              <cds-select label-text="发言人" value=${item.speaker} @cds-select-selected=${(event: CustomEvent<{ value: string }>) => this.updateSelected({ speaker: event.detail.value }, '修改发言人')}>
+              <cds-select label-text="发言人" value=${item.speaker} ?disabled=${item.locked} @cds-select-selected=${(event: CustomEvent<{ value: string }>) => this.updateSelected({ speaker: event.detail.value }, '修改发言人')}>
                 ${['主持人', '主讲人', '嘉宾 / 周然', '现场提问', '未知发言人'].map((speaker) => html`<cds-select-item value=${speaker}>${speaker}</cds-select-item>`)}
               </cds-select>
               <cds-number-input class="number-input" label="延迟（秒）" .value=${this.model.simulatedDelay} step="0.1" min="0" max="9" @input=${(event: Event) => this.automatic({ ...this.model, simulatedDelay: Number((event.currentTarget as any).value) })}></cds-number-input>
@@ -660,32 +889,33 @@ export class CaptionDesk extends LitElement {
             <cds-textarea
               class="caption-input"
               label-text="校对后的字幕文本"
-              helper-text="Ctrl/⌘ + 1–4 快速插入标点；术语规则将从左到右自动应用"
+              helper-text=${item.locked ? '已上屏锁定，不能修改' : 'Ctrl/⌘ + 1–4 快速插入标点；术语规则将从左到右自动应用'}
               .value=${item.corrected}
+              ?disabled=${item.locked}
               @input=${(event: Event) => this.updateSelected({ corrected: (event.currentTarget as any).value }, '')}
             ></cds-textarea>
             <div class="edit-toolbar">
               <span>快速标点</span>
-              <cds-button kind="ghost" size="sm" @click=${() => this.insertPunctuation('，')}>，逗号</cds-button>
-              <cds-button kind="ghost" size="sm" @click=${() => this.insertPunctuation('。')}>。句号</cds-button>
-              <cds-button kind="ghost" size="sm" @click=${() => this.insertPunctuation('？')}>？问号</cds-button>
-              <cds-button kind="ghost" size="sm" @click=${() => this.insertPunctuation('…')}>…省略</cds-button>
-              <cds-button kind="ghost" size="sm" @click=${() => this.wrapSelection('（', '）')}>（）括注</cds-button>
-              <cds-button kind="secondary" size="sm" @click=${this.normalizeCurrentNumbers}>规范化数字</cds-button>
+              <cds-button kind="ghost" size="sm" ?disabled=${item.locked} @click=${() => this.insertPunctuation('，')}>，逗号</cds-button>
+              <cds-button kind="ghost" size="sm" ?disabled=${item.locked} @click=${() => this.insertPunctuation('。')}>。句号</cds-button>
+              <cds-button kind="ghost" size="sm" ?disabled=${item.locked} @click=${() => this.insertPunctuation('？')}>？问号</cds-button>
+              <cds-button kind="ghost" size="sm" ?disabled=${item.locked} @click=${() => this.insertPunctuation('…')}>…省略</cds-button>
+              <cds-button kind="ghost" size="sm" ?disabled=${item.locked} @click=${() => this.wrapSelection('（', '）')}>（）括注</cds-button>
+              <cds-button kind="secondary" size="sm" ?disabled=${item.locked} @click=${this.normalizeCurrentNumbers}>规范化数字</cds-button>
             </div>
             <div class="rule-suggestions">
               <small>术语快捷替换</small>
               ${applicableRules.length ? applicableRules.map((rule) => html`
-                <cds-button kind="tertiary" size="sm" @click=${() => this.applyTerm(rule.id)}>${rule.source} → ${rule.replacement}</cds-button>
+                <cds-button kind="tertiary" size="sm" ?disabled=${item.locked} @click=${() => this.applyTerm(rule.id)}>${rule.source} → ${rule.replacement}</cds-button>
               `) : html`<small>当前发言人的规则为空</small>`}
-              <cds-button kind="ghost" size="sm" @click=${this.addRuleFromSelection}>＋ 从当前文本新建</cds-button>
+              <cds-button kind="ghost" size="sm" ?disabled=${item.locked} @click=${this.addRuleFromSelection}>＋ 从当前文本新建</cds-button>
             </div>
           </div>
           <div class="confirm-bar">
             <div class="confirm-hint"><kbd>⌘/Ctrl Enter</kbd> 确认并进入直播区 · <kbd>Alt J/K</kbd> 切换片段</div>
             <div>
-              <cds-button kind="danger--tertiary" size="sm" @click=${this.ignoreSelected}>忽略片段</cds-button>
-              <cds-button kind="primary" @click=${this.confirmSelected}>确认并送入直播区</cds-button>
+              <cds-button kind="danger--tertiary" size="sm" ?disabled=${item.locked} @click=${this.ignoreSelected}>忽略片段</cds-button>
+              <cds-button kind="primary" ?disabled=${item.locked} @click=${this.confirmSelected}>${item.locked ? '已上屏锁定' : '确认并送入直播区'}</cds-button>
             </div>
           </div>
         </div>
@@ -736,14 +966,18 @@ export class CaptionDesk extends LitElement {
           </div>
           <div class="live-timeline">
             ${confirmed.length ? confirmed.slice(-12).reverse().map((segment) => html`
-              <article class="live-item">
+              <article class="live-item ${segment.locked ? 'locked' : ''}">
                 <time>${formatClock(segment.startTime)} · ${segment.speaker}</time>
                 <p>${segment.corrected}</p>
-                ${segment.source === 'offline' ? html`<small>离线来源 · 恢复后合并</small>` : nothing}
+                ${segment.locked ? html`<small>已上屏 · 播控已确认并锁定</small>` : nothing}
+                ${!segment.locked && this.model.redeliveryQueue.includes(segment.id) ? html`<small class="redelivery-tag">待重新送播 · 排在播控清单之后</small>` : nothing}
+                ${!segment.locked && segment.source === 'offline' ? html`<small>离线来源 · 恢复后合并</small>` : nothing}
               </article>
             `) : html`<div class="empty"><strong>直播区等待内容</strong><p>确认一块字幕后，它会从这里进入实时输出。</p></div>`}
           </div>
           ${this.stats.offline > 0 ? html`<div class="delivery-status">离线发件箱有 ${this.stats.offline} 段待合并。恢复连接后按时间顺序提交，不会覆盖已确认内容。</div>` : nothing}
+          ${this.model.redeliveryQueue.length ? html`<div class="delivery-status redelivery">${this.model.redeliveryQueue.length} 段本地新确认内容未上屏，已排在播控清单之后重新送播。</div>` : nothing}
+          ${this.model.reconciledAt ? html`<div class="delivery-status reconciled">最近一次播控对账于 ${new Date(this.model.reconciledAt).toLocaleTimeString('zh-CN')} 完成，已上屏片段锁定。</div>` : nothing}
         </section>
 
         <section class="inspector-section">
@@ -759,6 +993,116 @@ export class CaptionDesk extends LitElement {
             ` : html`<span>请选择片段以查看上下文。</span>`}
           </div>
         </section>
+      </div>
+    `;
+  }
+
+  private renderCheckpointsTab() {
+    return html`
+      <div class="recovery-tab">
+        <p class="recovery-help">每次确认前都会先写一份恢复点，完整保存确认记录、术语规则和待确认队列。强制关机后重开，从这里挑一版接着往下用；恢复点写入失败时会自动从上一版重试，当前稿不会被改坏。</p>
+        <div class="recovery-actions">
+          <cds-button kind="primary" size="sm" @click=${this.createManualCheckpoint}>立即创建恢复点</cds-button>
+          <cds-button kind=${this.faultArmed ? 'danger' : 'ghost'} size="sm" @click=${this.toggleFault}>
+            ${this.faultArmed ? '已武装：下次确认将模拟写入失败' : '模拟恢复点写入失败'}
+          </cds-button>
+        </div>
+        ${this.checkpoints.length ? html`
+          <div class="checkpoint-list">
+            ${this.checkpoints.map((point) => html`
+              <div class="checkpoint-card ${point.id === this.model.lastCheckpointId ? 'current' : ''}">
+                <div class="checkpoint-head">
+                  <cds-tag size="sm" type=${point.kind === 'confirm' ? 'green' : point.kind === 'migrate' ? 'purple' : 'blue'}>${this.checkpointKindLabel(point.kind)}</cds-tag>
+                  <strong>${point.label}</strong>
+                  <span>${new Date(point.savedAt).toLocaleString('zh-CN')}</span>
+                  ${point.id === this.model.lastCheckpointId ? html`<cds-tag size="sm" type="outline">当前版本</cds-tag>` : nothing}
+                </div>
+                <div class="checkpoint-counts">
+                  <span>已确认 <b>${point.counts.confirmed}</b></span>
+                  <span>待确认 <b>${point.counts.pending}</b></span>
+                  <span>规则 <b>${point.counts.rules}</b></span>
+                </div>
+                ${point.reason ? html`<p class="checkpoint-reason">${point.reason}</p>` : nothing}
+                <div class="checkpoint-foot">
+                  <span>${Object.keys(point.fingerprints).length} 个片段快照</span>
+                  <cds-button kind="tertiary" size="sm" @click=${() => this.adoptCheckpoint(point)}>采用此版本继续</cds-button>
+                </div>
+              </div>
+            `)}
+          </div>
+        ` : html`<div class="empty"><strong>暂无恢复点</strong><p>确认字幕后会自动生成，也可以点上方按钮手动创建。</p></div>`}
+      </div>
+    `;
+  }
+
+  private renderReconcileTab() {
+    const redeliverySequences = (this.reconcileReport?.redeliver ?? [])
+      .map((id) => `#${this.model.segments.find((item) => item.id === id)?.sequence ?? '?'}`)
+      .join('、');
+    return html`
+      <div class="recovery-tab">
+        <p class="recovery-help">把播控带回的已播清单贴到下面（或生成模拟清单演示）。对账在同一处进行：已上屏的片段就地锁定、不再修改；本地新确认而清单里没有的，排到清单后面重新送播；两边对不上的逐条列出，等人处理后再继续。</p>
+        <div class="recovery-actions">
+          <cds-button kind="secondary" size="sm" @click=${this.fillSimulatedAiredList}>生成模拟播控清单</cds-button>
+          <cds-button kind="primary" size="sm" @click=${this.runReconcile}>开始对账</cds-button>
+        </div>
+        <cds-textarea
+          label-text="播控已播清单（JSON，含 items 数组）"
+          helper-text="清单由播控系统带回；可直接粘贴，或先生成模拟清单再修改"
+          .value=${this.airedDraft}
+          @input=${(event: Event) => { this.airedDraft = (event.currentTarget as any).value; }}
+        ></cds-textarea>
+        ${this.reconcileReport ? html`
+          <div class="reconcile-summary">
+            <span class="ok">已上屏锁定 ${this.reconcileReport.matched.length} 段</span>
+            <span class="warn">待重新送播 ${this.reconcileReport.redeliver.length} 段${redeliverySequences ? `（${redeliverySequences}）` : ''}</span>
+            <span class=${this.reconcileReport.mismatches.length ? 'bad' : ''}>异常 ${this.reconcileReport.mismatches.length} 条</span>
+          </div>
+          ${this.reconcileReport.redeliver.length ? html`
+            <div class="redelivery-note">
+              ${redeliverySequences} 为崩溃后本地新确认、但播控清单里没有的片段，已排在已播清单之后，恢复播出时重新送播，不会覆盖已上屏内容。
+            </div>
+          ` : nothing}
+          <div class="mismatch-list">
+            ${this.reconcileReport.mismatches.map((mismatch) => html`
+              <div class="mismatch-card">
+                <div class="mismatch-head">
+                  <cds-tag size="sm" type="red">${mismatch.kind === 'text-diff' ? '文本不一致' : '播控有本地无'}</cds-tag>
+                  <strong>第 ${mismatch.sequence} 段</strong>
+                </div>
+                <p class="mismatch-reason">${mismatch.reason}，请人工核对后选择处理方式。</p>
+                ${mismatch.kind === 'text-diff' ? html`
+                  <div class="mismatch-compare">
+                    <div><span>本地校对：</span>${mismatch.localText}</div>
+                    <div><span>播控上屏：</span>${mismatch.airedText}</div>
+                  </div>
+                  <div class="mismatch-actions">
+                    <cds-button kind="primary" size="sm" @click=${() => this.resolveMismatch(mismatch, true)}>按播控文本修正并锁定</cds-button>
+                    <cds-button kind="ghost" size="sm" @click=${() => this.resolveMismatch(mismatch, false)}>仅标记已知悉，稍后人工处理</cds-button>
+                  </div>
+                ` : html`
+                  <div class="mismatch-compare"><div><span>播控文本：</span>${mismatch.airedText}</div></div>
+                  <div class="mismatch-actions">
+                    <cds-button kind="ghost" size="sm" @click=${() => this.resolveMismatch(mismatch, false)}>已知悉</cds-button>
+                  </div>
+                `}
+              </div>
+            `)}
+          </div>
+        ` : nothing}
+      </div>
+    `;
+  }
+
+  private renderMigrationTab() {
+    return html`
+      <div class="recovery-tab">
+        <p class="recovery-help">旧稿首次打开已升级到恢复点格式（v${SCHEMA_VERSION}）。接不上的片段原样保留在当前稿中，原因逐条列在下面；确认记录、术语规则和待确认队列从升级时刻起受恢复点保护。</p>
+        ${this.migrationNotes.length ? html`
+          <ul class="migration-list">
+            ${this.migrationNotes.map((note) => html`<li>${note}</li>`)}
+          </ul>
+        ` : html`<div class="empty"><strong>当前草稿无需升级</strong><p>已是恢复点格式，每次确认都会自动存档。</p></div>`}
       </div>
     `;
   }
@@ -784,6 +1128,7 @@ export class CaptionDesk extends LitElement {
             </div>
           </div>
           <div class="header-actions">
+            <cds-button kind="ghost" size="sm" @click=${() => this.openRecoveryCenter('checkpoints')}>恢复中心${this.checkpoints.length ? `（${this.checkpoints.length}）` : ''}</cds-button>
             <cds-button kind="ghost" size="sm" @click=${this.toggleTheme}>${this.dark ? '浅色界面' : '深色值守'}</cds-button>
             <cds-button kind="ghost" size="sm" @click=${this.undo}>撤销</cds-button>
             <cds-button kind="ghost" size="sm" @click=${this.redo}>重做</cds-button>
@@ -849,6 +1194,23 @@ export class CaptionDesk extends LitElement {
             <div class="column-body">${this.renderInspector()}</div>
           </section>
         </main>
+
+        <cds-modal ?open=${this.showRecoveryCenter} size="lg" @cds-modal-closed=${() => { this.showRecoveryCenter = false; }}>
+          <cds-modal-header><h3>恢复中心 · 崩溃后续接</h3></cds-modal-header>
+          <cds-modal-body>
+            <div class="recovery-tabs">
+              <button class=${this.recoveryTab === 'checkpoints' ? 'active' : ''} @click=${() => { this.recoveryTab = 'checkpoints'; }}>恢复点${this.checkpoints.length ? ` ${this.checkpoints.length}` : ''}</button>
+              <button class=${this.recoveryTab === 'reconcile' ? 'active' : ''} @click=${() => { this.recoveryTab = 'reconcile'; }}>播控对账${this.reconcileReport?.mismatches.length ? ` ${this.reconcileReport.mismatches.length}` : ''}</button>
+              <button class=${this.recoveryTab === 'migration' ? 'active' : ''} @click=${() => { this.recoveryTab = 'migration'; }}>升级记录${this.migrationNotes.length ? ` ${this.migrationNotes.length}` : ''}</button>
+            </div>
+            ${this.recoveryTab === 'checkpoints' ? this.renderCheckpointsTab() : nothing}
+            ${this.recoveryTab === 'reconcile' ? this.renderReconcileTab() : nothing}
+            ${this.recoveryTab === 'migration' ? this.renderMigrationTab() : nothing}
+          </cds-modal-body>
+          <cds-modal-footer>
+            <cds-button kind="secondary" @click=${() => { this.showRecoveryCenter = false; }}>关闭并继续使用当前稿</cds-button>
+          </cds-modal-footer>
+        </cds-modal>
 
         <div class="toast-stack">
           ${this.toasts.map((toast) => html`

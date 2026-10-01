@@ -1,6 +1,7 @@
 import '@carbon/styles/css/styles.css';
 import '@carbon/web-components/es/components/button/index.js';
 import '@carbon/web-components/es/components/dropdown/index.js';
+import '@carbon/web-components/es/components/modal/index.js';
 import '@carbon/web-components/es/components/number-input/index.js';
 import '@carbon/web-components/es/components/notification/index.js';
 import '@carbon/web-components/es/components/select/index.js';
