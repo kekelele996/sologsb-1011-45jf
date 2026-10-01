@@ -18,6 +18,14 @@ export interface CaptionSegment {
   staleReason?: string;
   revision: number;
   tags: string[];
+  /** 播控已播清单核对后标记为已上屏 */
+  aired?: boolean;
+  /** 已上屏片段锁定，不允许再改 */
+  locked?: boolean;
+  /** 本地已确认但不在已播清单中，排在清单后面重新送 */
+  resend?: boolean;
+  /** 旧稿升级时无法接入恢复点的片段保留原因 */
+  migrationNote?: string;
 }
 
 export interface TermRule {
@@ -32,6 +40,7 @@ export interface TermRule {
 }
 
 export interface DeskModel {
+  schemaVersion: number;
   eventName: string;
   eventDate: string;
   segments: CaptionSegment[];
@@ -43,7 +52,50 @@ export interface DeskModel {
   nextSequence: number;
   autoStream: boolean;
   lastMergedAt?: number;
+  reconciliation?: ReconciliationReport;
   updatedAt: number;
+}
+
+export type RecoveryKind = 'confirm' | 'merge' | 'reconcile' | 'migrate' | 'restore';
+
+/** 每次确认前先落盘的恢复点：确认记录、术语规则和待确认队列的快照 */
+export interface RecoveryPoint {
+  id: string;
+  createdAt: number;
+  label: string;
+  kind: RecoveryKind;
+  counts: { confirmed: number; pending: number; rules: number };
+  snapshot: RecoverySnapshot;
+  status: 'complete' | 'failed';
+  error?: string;
+}
+
+export interface RecoverySnapshot {
+  segments: CaptionSegment[];
+  rules: TermRule[];
+  nextSequence: number;
+  selectedId: string;
+  connection: ConnectionState;
+  reconciliation?: ReconciliationReport;
+}
+
+/** 播控带回的已播清单中的一条记录 */
+export interface AiredEntry {
+  id: string;
+  sequence: number;
+  text: string;
+  airedAt: number;
+}
+
+/** 已播清单与本地稿的对账结果 */
+export interface ReconciliationReport {
+  importedAt: number;
+  entryCount: number;
+  matched: { entryId: string; segmentId: string }[];
+  /** 本地已确认但未上屏，排在已播清单后面重新送 */
+  resend: string[];
+  /** 播控清单有记录但本地对不上，列出来等人处理 */
+  unmatched: AiredEntry[];
 }
 
 export interface ToastMessage {
@@ -55,6 +107,8 @@ export interface ToastMessage {
 
 const now = Date.now();
 export const STORAGE_KEY = 'sologsb-1011-live-caption-desk-v1';
+export const RECOVERY_KEY = `${STORAGE_KEY}-recovery-log`;
+export const SCHEMA_VERSION = 2;
 
 function segment(
   id: string,
@@ -101,6 +155,7 @@ const duplicate: CaptionSegment = {
 
 export function createInitialModel(): DeskModel {
   return {
+    schemaVersion: SCHEMA_VERSION,
     eventName: '新品发布会现场字幕',
     eventDate: new Date(now).toISOString().slice(0, 10),
     segments: [...seededSegments, duplicate],
@@ -180,12 +235,15 @@ export function applyRules(text: string, model: DeskModel): { text: string; used
   return { text: normalizePunctuation(next), used };
 }
 
+export function normalizeForMatch(value: string): string {
+  return value.replace(/[\s，。！？；：,.;:!?]/g, '').toLocaleLowerCase();
+}
+
 export function isDuplicate(candidate: CaptionSegment, existing: CaptionSegment[]): CaptionSegment | undefined {
-  const normalize = (value: string) => value.replace(/[\s，。！？；：,.;:!?]/g, '').toLocaleLowerCase();
-  const candidateText = normalize(candidate.corrected || candidate.original);
+  const candidateText = normalizeForMatch(candidate.corrected || candidate.original);
   return existing.find((segmentItem) => {
     if (segmentItem.id === candidate.id || segmentItem.state === 'ignored') return false;
-    const text = normalize(segmentItem.corrected || segmentItem.original);
+    const text = normalizeForMatch(segmentItem.corrected || segmentItem.original);
     if (!candidateText || !text) return false;
     return text === candidateText || (Math.abs(segmentItem.startTime - candidate.startTime) < 12 && (text.includes(candidateText) || candidateText.includes(text)));
   });
@@ -197,7 +255,7 @@ export function mergeConfirmedSegments(model: DeskModel): DeskModel {
     .map((item) => ({ ...item }))
     .sort((a, b) => a.sequence - b.sequence || a.startTime - b.startTime)
     .map((item): CaptionSegment => {
-      if (item.source === 'offline' && item.state === 'confirmed') {
+      if (item.source === 'offline' && item.state === 'confirmed' && !item.locked) {
         item.source = item.confirmedAt && Date.now() - item.confirmedAt > 90_000 ? 'offline' : 'live';
         item.staleReason = Date.now() - item.receivedAt > 90_000 ? `离线恢复后合并，原始片段已延迟 ${Math.round((Date.now() - item.receivedAt) / 1000)} 秒` : undefined;
         if (item.staleReason) item.state = 'stale';
@@ -226,11 +284,15 @@ export function queueStats(model: DeskModel) {
   const stale = model.segments.filter((item) => item.state === 'stale');
   const duplicate = model.segments.filter((item) => item.state === 'duplicate');
   const offline = model.segments.filter((item) => item.source === 'offline' && item.state === 'confirmed');
+  const locked = model.segments.filter((item) => item.locked);
+  const resend = model.segments.filter((item) => item.resend && !item.aired && item.state === 'confirmed');
   return {
     pending: pending.length,
     stale: stale.length,
     duplicate: duplicate.length,
     offline: offline.length,
+    locked: locked.length,
+    resend: resend.length,
     backlog: pending.length + stale.length + duplicate.length + offline.length,
     oldestWaitSeconds: pending.length ? Math.max(...pending.map((item) => Math.round((Date.now() - item.receivedAt) / 1000))) : 0,
   };
@@ -303,4 +365,174 @@ export function toSrt(model: DeskModel): string {
     .sort((a, b) => a.startTime - b.startTime)
     .map((item, index) => `${index + 1}\n${stamp(item.startTime)} --> ${stamp(item.startTime + 7)}\n[${item.speaker}] ${item.corrected}\n`)
     .join('\n');
+}
+
+/** 生成一份恢复点，快照里带齐确认记录、术语规则和待确认队列 */
+export function createRecoveryPoint(label: string, kind: RecoveryKind, model: DeskModel): RecoveryPoint {
+  return {
+    id: `rp-${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 6)}`,
+    createdAt: Date.now(),
+    label,
+    kind,
+    counts: {
+      confirmed: model.segments.filter((item) => item.state === 'confirmed').length,
+      pending: model.segments.filter((item) => item.state === 'pending' || item.state === 'stale' || item.state === 'duplicate').length,
+      rules: model.rules.length,
+    },
+    snapshot: {
+      segments: structuredClone(model.segments),
+      rules: structuredClone(model.rules),
+      nextSequence: model.nextSequence,
+      selectedId: model.selectedId,
+      connection: model.connection,
+      reconciliation: model.reconciliation ? structuredClone(model.reconciliation) : undefined,
+    },
+    status: 'complete',
+  };
+}
+
+/** 解析播控带回的已播清单，每行一条，支持“序号 文本”“序号，文本”或纯文本 */
+export function parseAiredList(raw: string): AiredEntry[] {
+  const importedAt = Date.now();
+  return raw
+    .split(/\r?\n/)
+    .map((line) => line.trim())
+    .filter(Boolean)
+    .map((line, index) => {
+      const matched = line.match(/^(\d{1,4})\s*[,，、.．]?\s+(.+)$/u) ?? line.match(/^(\d{1,4})[,，、.．](.+)$/u);
+      return {
+        id: `aired-${importedAt.toString(36)}-${index + 1}`,
+        sequence: matched ? Number(matched[1]) : index + 1,
+        text: (matched ? matched[2] : line).trim(),
+        airedAt: importedAt,
+      };
+    });
+}
+
+/**
+ * 已播清单与本地稿对账：
+ * 对上的片段标记已上屏并锁定；本地已确认但没上屏的排进重送队列；
+ * 清单里对不上的记录原样留在报告里等人处理。
+ */
+export function reconcileAiredList(model: DeskModel, entries: AiredEntry[]): DeskModel {
+  const matched: ReconciliationReport['matched'] = [];
+  const unmatched: AiredEntry[] = [];
+  const usedSegments = new Set<string>();
+  const confirmed = model.segments.filter((item) => item.state === 'confirmed');
+
+  for (const entry of entries) {
+    const target = normalizeForMatch(entry.text);
+    let hit = confirmed.find((item) => !usedSegments.has(item.id) && item.sequence === entry.sequence);
+    if (!hit && target) {
+      hit = confirmed.find((item) => !usedSegments.has(item.id) && normalizeForMatch(item.corrected || item.original) === target);
+    }
+    if (hit) {
+      matched.push({ entryId: entry.id, segmentId: hit.id });
+      usedSegments.add(hit.id);
+    } else {
+      unmatched.push(entry);
+    }
+  }
+
+  const matchedIds = new Set(matched.map((item) => item.segmentId));
+  const resend = confirmed.filter((item) => !matchedIds.has(item.id) && !item.aired).map((item) => item.id);
+  const resendIds = new Set(resend);
+
+  const segments = model.segments.map((item) => {
+    if (matchedIds.has(item.id)) return { ...item, aired: true, locked: true, resend: false };
+    if (resendIds.has(item.id)) return { ...item, resend: true };
+    return item;
+  });
+
+  return {
+    ...model,
+    segments,
+    reconciliation: {
+      importedAt: Date.now(),
+      entryCount: entries.length,
+      matched,
+      resend,
+      unmatched,
+    },
+    updatedAt: Date.now(),
+  };
+}
+
+const SEGMENT_STATES: SegmentState[] = ['pending', 'confirmed', 'duplicate', 'stale', 'ignored'];
+const SEGMENT_SOURCES: SegmentSource[] = ['live', 'offline', 'manual'];
+
+/**
+ * 旧稿（没有 schemaVersion 的 v1 数据）第一次打开时升级到恢复点体系。
+ * 字段齐全的片段正常接入；接不上的片段按原样保留并写上 migrationNote 说明原因。
+ */
+export function migrateLegacyModel(raw: unknown): { model: DeskModel; notes: string[] } {
+  const source = (raw ?? {}) as Record<string, unknown>;
+  const fallback = createInitialModel();
+  const migratedAt = Date.now();
+  const notes: string[] = [];
+
+  const segments: CaptionSegment[] = (Array.isArray(source.segments) ? source.segments : []).map((item: unknown, index: number) => {
+    const record = (item ?? {}) as Record<string, unknown>;
+    const missing: string[] = [];
+    if (typeof record.id !== 'string' || !record.id) missing.push('ID');
+    if (typeof record.sequence !== 'number') missing.push('序号');
+    if (typeof record.original !== 'string' && typeof record.corrected !== 'string') missing.push('字幕文本');
+    const segmentItem: CaptionSegment = {
+      id: typeof record.id === 'string' && record.id ? record.id : `legacy-${migratedAt.toString(36)}-${index + 1}`,
+      sequence: typeof record.sequence === 'number' ? record.sequence : index + 1,
+      startTime: typeof record.startTime === 'number' ? record.startTime : index * 8,
+      receivedAt: typeof record.receivedAt === 'number' ? record.receivedAt : migratedAt,
+      confirmedAt: typeof record.confirmedAt === 'number' ? record.confirmedAt : undefined,
+      speaker: typeof record.speaker === 'string' && record.speaker ? record.speaker : '未知发言人',
+      original: typeof record.original === 'string' ? record.original : String(record.corrected ?? ''),
+      corrected: typeof record.corrected === 'string' ? record.corrected : String(record.original ?? ''),
+      numberHints: typeof record.numberHints === 'string' ? record.numberHints : '',
+      source: SEGMENT_SOURCES.includes(record.source as SegmentSource) ? (record.source as SegmentSource) : 'live',
+      state: SEGMENT_STATES.includes(record.state as SegmentState) ? (record.state as SegmentState) : 'pending',
+      duplicateOf: typeof record.duplicateOf === 'string' ? record.duplicateOf : undefined,
+      staleReason: typeof record.staleReason === 'string' ? record.staleReason : undefined,
+      revision: typeof record.revision === 'number' ? record.revision : 0,
+      tags: Array.isArray(record.tags) ? record.tags.filter((tag): tag is string => typeof tag === 'string') : [],
+      aired: record.aired === true,
+      locked: record.locked === true,
+      resend: record.resend === true,
+    };
+    if (missing.length) {
+      segmentItem.migrationNote = `旧稿缺少${missing.join('、')}，无法完整接入恢复点，已按原样保留`;
+      notes.push(`第 ${index + 1} 段（${segmentItem.id}）：${segmentItem.migrationNote}`);
+    }
+    return segmentItem;
+  });
+
+  const rules: TermRule[] = (Array.isArray(source.rules) ? source.rules : []).map((item: unknown, index: number) => {
+    const record = (item ?? {}) as Record<string, unknown>;
+    return {
+      id: typeof record.id === 'string' && record.id ? record.id : `term-legacy-${migratedAt.toString(36)}-${index + 1}`,
+      source: typeof record.source === 'string' ? record.source : '',
+      replacement: typeof record.replacement === 'string' ? record.replacement : '',
+      speaker: typeof record.speaker === 'string' ? record.speaker : '',
+      enabled: record.enabled !== false,
+      caseSensitive: record.caseSensitive === true,
+      usageCount: typeof record.usageCount === 'number' ? record.usageCount : 0,
+      createdAt: typeof record.createdAt === 'number' ? record.createdAt : migratedAt,
+    };
+  }).filter((rule) => rule.source && rule.replacement);
+
+  const model: DeskModel = {
+    schemaVersion: SCHEMA_VERSION,
+    eventName: typeof source.eventName === 'string' && source.eventName ? source.eventName : fallback.eventName,
+    eventDate: typeof source.eventDate === 'string' && source.eventDate ? source.eventDate : fallback.eventDate,
+    segments,
+    rules,
+    selectedId: typeof source.selectedId === 'string' ? source.selectedId : (segments[0]?.id ?? ''),
+    connection: source.connection === 'degraded' || source.connection === 'offline' ? source.connection : 'connected',
+    simulatedDelay: typeof source.simulatedDelay === 'number' ? source.simulatedDelay : fallback.simulatedDelay,
+    fontSize: typeof source.fontSize === 'number' ? Math.max(14, Math.min(28, source.fontSize)) : fallback.fontSize,
+    nextSequence: typeof source.nextSequence === 'number' ? source.nextSequence : segments.length + 1,
+    autoStream: source.autoStream !== false,
+    lastMergedAt: typeof source.lastMergedAt === 'number' ? source.lastMergedAt : undefined,
+    reconciliation: undefined,
+    updatedAt: typeof source.updatedAt === 'number' ? source.updatedAt : migratedAt,
+  };
+  return { model, notes };
 }
